@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pyflow
+      POSTGRES_PASSWORD: pyflow
+      POSTGRES_DB: pyflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pyflow -d pyflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      PYFLOW_DATABASE_URL: postgresql://pyflow:pyflow@postgres:5432/pyflow
+      PYFLOW_REDIS_URL: redis://redis:6379/0
+      PYFLOW_DAGS_FOLDER: /app/dags
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./dags:/app/dags
+      - ./pyflow:/app/pyflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn pyflow.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  pgdata:
