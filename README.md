@@ -4,7 +4,7 @@ A lightweight workflow orchestration platform in Python. Define pipelines as
 dependency graphs (DAGs), run them in the right order with parallelism, retry
 failures, backfill history, and watch everything in a monitoring console.
 
-> Status: **Phase 2 of 9 complete** (core DAG engine). See the roadmap below.
+> Status: **Phase 3 of 9 complete** (core engine, REST API, PostgreSQL persistence). See the roadmap below.
 
 ## Why
 
@@ -64,12 +64,30 @@ unrelated branches keep going.
 3. Task states: `pending -> running -> success | failed`, or `upstream_failed`
    when skipped.
 
+## REST API
+
+With the stack running, interactive docs are at http://localhost:8000/docs.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Health check |
+| GET | `/dags` | List workflows |
+| POST | `/dags` | Create a workflow (validated: cycles, unknown dependencies, bad operations) |
+| GET | `/dags/{dag_id}` | Workflow details and execution levels |
+| POST | `/dags/{dag_id}/runs` | Run a workflow |
+| GET | `/runs` | Run history (optional `?dag_id=`) |
+| GET | `/runs/{run_id}` | One run with per-task state, result, error, duration |
+
+Workflows, runs and task results are stored in PostgreSQL, so history survives
+restarts. Supported task operations: `echo`, `add`, `multiply`, `subtract`, `divide`.
+
 ## Project layout
 
 ```
 pyflow/          core package
   dag.py         DAG, Task, topological sort, cycle detection
   executor.py    asyncio executor, task states, run results
+  db.py          SQLAlchemy models (dags, runs, task_runs)
   api/           FastAPI app
 dags/            example workflows
 tests/           pytest suite
@@ -80,7 +98,7 @@ docker-compose.yml   API + PostgreSQL + Redis
 
 - [x] 1. Repo setup, Docker Compose, health endpoint
 - [x] 2. Core DAG engine (topological sort, parallel execution, failure propagation)
-- [ ] 3. Persistence: runs and task states in PostgreSQL
+- [x] 3. Persistence: DAGs, runs and task states in PostgreSQL
 - [ ] 4. Workers + Redis queue
 - [ ] 5. Retries with exponential backoff, pause/resume, alerts
 - [ ] 6. Cron schedules and historical backfills

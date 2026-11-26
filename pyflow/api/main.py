@@ -1,29 +1,41 @@
+"""FastAPI endpoints for the PyFlow Orchestrator.
 
-"""FastAPI endpoints for the PyFlow Orchestrator."""
+Workflows and run history are stored in the database (PostgreSQL in Docker),
+so they survive restarts.
+"""
 
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from pyflow import __version__
 from pyflow.dag import DAG
+from pyflow.db import DagRecord, RunRecord, TaskRunRecord, get_session, init_db
 from pyflow.executor import run_dag
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()  # create tables on startup if they do not exist yet
+    yield
+
 
 app = FastAPI(
     title="PyFlow Orchestrator",
     description="Create, execute, and monitor task workflows.",
     version=__version__,
+    lifespan=lifespan,
 )
 
-# Temporary in-memory storage. PostgreSQL persistence comes next.
-dags: dict[str, DAG] = {}
-dag_details: dict[str, dict[str, Any]] = {}
-runs: dict[str, dict[str, Any]] = {}
+SUPPORTED_OPERATIONS = {"echo", "add", "multiply", "subtract", "divide"}
 
 
 class TaskDefinition(BaseModel):
@@ -72,62 +84,107 @@ def make_task_function(operation: str, params: dict[str, Any]):
     return execute
 
 
+def build_dag(definition: DAGDefinition) -> DAG:
+    """Turn a stored definition into a runnable DAG. Raises ValueError if invalid."""
+    if not definition.tasks:
+        raise ValueError("A DAG needs at least one task")
+
+    task_ids = [task.task_id for task in definition.tasks]
+    if len(set(task_ids)) != len(task_ids):
+        raise ValueError("Duplicate task IDs")
+
+    for task in definition.tasks:
+        if task.operation not in SUPPORTED_OPERATIONS:
+            raise ValueError(
+                f"Unsupported operation '{task.operation}' in task '{task.task_id}'. "
+                f"Choose from: {', '.join(sorted(SUPPORTED_OPERATIONS))}"
+            )
+
+    dag = DAG(definition.dag_id, definition.description)
+    for task in definition.tasks:
+        dag.add_task(task.task_id, make_task_function(task.operation, task.params))
+
+    for task in definition.tasks:
+        for dependency in task.depends_on:
+            if dependency not in dag.tasks:
+                raise ValueError(
+                    f"Unknown dependency '{dependency}' for task '{task.task_id}'"
+                )
+            dag.tasks[dependency].set_downstream(dag.tasks[task.task_id])
+
+    dag.validate()
+    return dag
+
+
+def _iso(value: datetime | None) -> str | None:
+    """ISO timestamp, treating naive datetimes (some databases) as UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def run_to_dict(run: RunRecord) -> dict[str, Any]:
+    return {
+        "run_id": run.run_id,
+        "dag_id": run.dag_id,
+        "status": run.status,
+        "started_at": _iso(run.started_at),
+        "finished_at": _iso(run.finished_at),
+        "tasks": {
+            task.task_id: {
+                "state": task.state,
+                "started_at": _iso(task.started_at),
+                "finished_at": _iso(task.finished_at),
+                "duration_seconds": task.duration_seconds,
+                "result": task.result,
+                "error": task.error,
+            }
+            for task in run.tasks
+        },
+    }
+
+
+def dag_summary(record: DagRecord) -> dict[str, Any]:
+    tasks = [task["task_id"] for task in record.definition["tasks"]]
+    return {
+        "dag_id": record.dag_id,
+        "description": record.description,
+        "task_count": len(tasks),
+        "tasks": tasks,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
 
 
 @app.get("/dags")
-def list_dags():
-    return [
-        {
-            "dag_id": dag_id,
-            **dag_details[dag_id],
-        }
-        for dag_id in dags
-    ]
+def list_dags(session: Session = Depends(get_session)):
+    records = session.scalars(select(DagRecord).order_by(DagRecord.created_at)).all()
+    return [dag_summary(record) for record in records]
 
 
 @app.post("/dags", status_code=201)
-def create_dag(definition: DAGDefinition):
-    if definition.dag_id in dags:
+def create_dag(definition: DAGDefinition, session: Session = Depends(get_session)):
+    if session.get(DagRecord, definition.dag_id) is not None:
         raise HTTPException(status_code=409, detail="DAG already exists")
 
-    if not definition.tasks:
-        raise HTTPException(status_code=400, detail="A DAG needs at least one task")
-
-    dag = DAG(definition.dag_id, definition.description)
-    task_ids = {task.task_id for task in definition.tasks}
-
-    if len(task_ids) != len(definition.tasks):
-        raise HTTPException(status_code=400, detail="Duplicate task IDs")
-
     try:
-        for task in definition.tasks:
-            dag.add_task(
-                task.task_id,
-                make_task_function(task.operation, task.params),
-            )
-
-        for task in definition.tasks:
-            for dependency in task.depends_on:
-                if dependency not in task_ids:
-                    raise ValueError(
-                        f"Unknown dependency '{dependency}' for task '{task.task_id}'"
-                    )
-                dag.tasks[dependency].set_downstream(dag.tasks[task.task_id])
-
-        dag.validate()
-
+        dag = build_dag(definition)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    dags[definition.dag_id] = dag
-    dag_details[definition.dag_id] = {
-        "description": definition.description,
-        "task_count": len(definition.tasks),
-        "tasks": list(task_ids),
-    }
+    session.add(
+        DagRecord(
+            dag_id=definition.dag_id,
+            description=definition.description,
+            definition=definition.model_dump(),
+        )
+    )
+    session.commit()
 
     return {
         "message": "DAG created successfully",
@@ -138,64 +195,59 @@ def create_dag(definition: DAGDefinition):
 
 
 @app.get("/dags/{dag_id}")
-def get_dag(dag_id: str):
-    if dag_id not in dags:
+def get_dag(dag_id: str, session: Session = Depends(get_session)):
+    record = session.get(DagRecord, dag_id)
+    if record is None:
         raise HTTPException(status_code=404, detail="DAG not found")
 
-    return {
-        "dag_id": dag_id,
-        **dag_details[dag_id],
-        "execution_levels": dags[dag_id].topological_levels(),
-    }
+    dag = build_dag(DAGDefinition(**record.definition))
+    return {**dag_summary(record), "execution_levels": dag.topological_levels()}
 
 
 @app.post("/dags/{dag_id}/runs", status_code=201)
-async def trigger_dag(dag_id: str):
-    if dag_id not in dags:
+async def trigger_dag(dag_id: str, session: Session = Depends(get_session)):
+    record = session.get(DagRecord, dag_id)
+    if record is None:
         raise HTTPException(status_code=404, detail="DAG not found")
 
-    run_id = str(uuid.uuid4())
-    started_at = datetime.now(timezone.utc)
+    dag = build_dag(DAGDefinition(**record.definition))
+    result = await run_dag(dag)
 
-    result = await run_dag(dags[dag_id])
-
-    finished_at = result.finished_at or datetime.now(timezone.utc)
-
-    run_data = {
-        "run_id": run_id,
-        "dag_id": dag_id,
-        "status": "success" if result.success else "failed",
-        "started_at": started_at.isoformat(),
-        "finished_at": finished_at.isoformat(),
-        "tasks": {
-            task_id: {
-                "state": task.state.value,
-                "started_at": (
-                    task.started_at.isoformat() if task.started_at else None
-                ),
-                "finished_at": (
-                    task.finished_at.isoformat() if task.finished_at else None
-                ),
-                "duration_seconds": task.duration_seconds,
-                "result": task.result,
-                "error": task.error,
-            }
+    run = RunRecord(
+        run_id=str(uuid.uuid4()),
+        dag_id=dag_id,
+        status="success" if result.success else "failed",
+        started_at=result.started_at,
+        finished_at=result.finished_at or datetime.now(timezone.utc),
+        tasks=[
+            TaskRunRecord(
+                task_id=task_id,
+                state=task.state.value,
+                started_at=task.started_at,
+                finished_at=task.finished_at,
+                duration_seconds=task.duration_seconds,
+                result=task.result,
+                error=task.error,
+            )
             for task_id, task in result.tasks.items()
-        },
-    }
-
-    runs[run_id] = run_data
-    return run_data
+        ],
+    )
+    session.add(run)
+    session.commit()
+    return run_to_dict(run)
 
 
 @app.get("/runs")
-def list_runs():
-    return list(runs.values())
+def list_runs(dag_id: str | None = None, session: Session = Depends(get_session)):
+    query = select(RunRecord).order_by(RunRecord.started_at)
+    if dag_id:
+        query = query.where(RunRecord.dag_id == dag_id)
+    return [run_to_dict(run) for run in session.scalars(query).all()]
 
 
 @app.get("/runs/{run_id}")
-def get_run(run_id: str):
-    if run_id not in runs:
+def get_run(run_id: str, session: Session = Depends(get_session)):
+    run = session.get(RunRecord, run_id)
+    if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
-
-    return runs[run_id]
+    return run_to_dict(run)
