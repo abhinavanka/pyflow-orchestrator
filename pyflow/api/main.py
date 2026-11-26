@@ -1,30 +1,29 @@
 """FastAPI endpoints for the PyFlow Orchestrator.
 
 Workflows and run history are stored in the database (PostgreSQL in Docker),
-so they survive restarts.
+so they survive restarts. Runs execute in the background; their state is
+written to the database as they progress.
 """
 
 from __future__ import annotations
 
-import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from pyflow import __version__
-from pyflow.dag import DAG
-from pyflow.db import DagRecord, RunRecord, TaskRunRecord, get_session, init_db
-from pyflow.executor import run_dag
+from pyflow import __version__, runner
+from pyflow.db import DagRecord, RunRecord, get_session, init_db
+from pyflow.definitions import DAGDefinition, build_dag
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_db()  # create tables on startup if they do not exist yet
+    init_db()  # create tables / add new columns if needed
+    runner.mark_interrupted_runs()
     yield
 
 
@@ -35,89 +34,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-SUPPORTED_OPERATIONS = {"echo", "add", "multiply", "subtract", "divide"}
-
-
-class TaskDefinition(BaseModel):
-    task_id: str
-    operation: str
-    params: dict[str, Any] = Field(default_factory=dict)
-    depends_on: list[str] = Field(default_factory=list)
-
-
-class DAGDefinition(BaseModel):
-    dag_id: str
-    description: str = ""
-    tasks: list[TaskDefinition]
-
-
-def make_task_function(operation: str, params: dict[str, Any]):
-    """Create a callable for a supported task operation."""
-
-    def execute():
-        if operation == "echo":
-            return params.get("message", "Hello from PyFlow")
-
-        if operation == "add":
-            return sum(params["values"])
-
-        if operation == "multiply":
-            result = 1
-            for value in params["values"]:
-                result *= value
-            return result
-
-        if operation == "subtract":
-            values = params["values"]
-            if len(values) != 2:
-                raise ValueError("subtract requires exactly two values")
-            return values[0] - values[1]
-
-        if operation == "divide":
-            values = params["values"]
-            if len(values) != 2:
-                raise ValueError("divide requires exactly two values")
-            return values[0] / values[1]
-
-        raise ValueError(f"Unsupported operation: {operation}")
-
-    return execute
-
-
-def build_dag(definition: DAGDefinition) -> DAG:
-    """Turn a stored definition into a runnable DAG. Raises ValueError if invalid."""
-    if not definition.tasks:
-        raise ValueError("A DAG needs at least one task")
-
-    task_ids = [task.task_id for task in definition.tasks]
-    if len(set(task_ids)) != len(task_ids):
-        raise ValueError("Duplicate task IDs")
-
-    for task in definition.tasks:
-        if task.operation not in SUPPORTED_OPERATIONS:
-            raise ValueError(
-                f"Unsupported operation '{task.operation}' in task '{task.task_id}'. "
-                f"Choose from: {', '.join(sorted(SUPPORTED_OPERATIONS))}"
-            )
-
-    dag = DAG(definition.dag_id, definition.description)
-    for task in definition.tasks:
-        dag.add_task(task.task_id, make_task_function(task.operation, task.params))
-
-    for task in definition.tasks:
-        for dependency in task.depends_on:
-            if dependency not in dag.tasks:
-                raise ValueError(
-                    f"Unknown dependency '{dependency}' for task '{task.task_id}'"
-                )
-            dag.tasks[dependency].set_downstream(dag.tasks[task.task_id])
-
-    dag.validate()
-    return dag
-
 
 def _iso(value: datetime | None) -> str | None:
-    """ISO timestamp, treating naive datetimes (some databases) as UTC."""
+    """ISO timestamp in UTC, treating naive datetimes (some databases) as UTC."""
     if value is None:
         return None
     if value.tzinfo is None:
@@ -135,6 +54,7 @@ def run_to_dict(run: RunRecord) -> dict[str, Any]:
         "tasks": {
             task.task_id: {
                 "state": task.state,
+                "attempts": task.attempts,
                 "started_at": _iso(task.started_at),
                 "finished_at": _iso(task.finished_at),
                 "duration_seconds": task.duration_seconds,
@@ -151,14 +71,25 @@ def dag_summary(record: DagRecord) -> dict[str, Any]:
     return {
         "dag_id": record.dag_id,
         "description": record.description,
+        "is_paused": record.is_paused,
         "task_count": len(tasks),
         "tasks": tasks,
     }
 
 
+def _get_dag_or_404(session: Session, dag_id: str) -> DagRecord:
+    record = session.get(DagRecord, dag_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="DAG not found")
+    return record
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
+
+
+# -- workflows ----------------------------------------------------------------
 
 
 @app.get("/dags")
@@ -196,52 +127,69 @@ def create_dag(definition: DAGDefinition, session: Session = Depends(get_session
 
 @app.get("/dags/{dag_id}")
 def get_dag(dag_id: str, session: Session = Depends(get_session)):
-    record = session.get(DagRecord, dag_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="DAG not found")
-
+    record = _get_dag_or_404(session, dag_id)
     dag = build_dag(DAGDefinition(**record.definition))
     return {**dag_summary(record), "execution_levels": dag.topological_levels()}
 
 
-@app.post("/dags/{dag_id}/runs", status_code=201)
-async def trigger_dag(dag_id: str, session: Session = Depends(get_session)):
-    record = session.get(DagRecord, dag_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="DAG not found")
-
-    dag = build_dag(DAGDefinition(**record.definition))
-    result = await run_dag(dag)
-
-    run = RunRecord(
-        run_id=str(uuid.uuid4()),
-        dag_id=dag_id,
-        status="success" if result.success else "failed",
-        started_at=result.started_at,
-        finished_at=result.finished_at or datetime.now(timezone.utc),
-        tasks=[
-            TaskRunRecord(
-                task_id=task_id,
-                state=task.state.value,
-                started_at=task.started_at,
-                finished_at=task.finished_at,
-                duration_seconds=task.duration_seconds,
-                result=task.result,
-                error=task.error,
-            )
-            for task_id, task in result.tasks.items()
-        ],
-    )
-    session.add(run)
+@app.post("/dags/{dag_id}/pause")
+def pause_dag(dag_id: str, session: Session = Depends(get_session)):
+    """Stop this workflow from being triggered until it is resumed."""
+    record = _get_dag_or_404(session, dag_id)
+    record.is_paused = True
     session.commit()
+    return {"dag_id": dag_id, "is_paused": True}
+
+
+@app.post("/dags/{dag_id}/resume")
+def resume_dag(dag_id: str, session: Session = Depends(get_session)):
+    record = _get_dag_or_404(session, dag_id)
+    record.is_paused = False
+    session.commit()
+    return {"dag_id": dag_id, "is_paused": False}
+
+
+# -- runs ---------------------------------------------------------------------
+
+
+@app.post("/dags/{dag_id}/runs", status_code=202)
+async def trigger_dag(
+    dag_id: str,
+    response: Response,
+    wait: bool = False,
+    session: Session = Depends(get_session),
+):
+    """Start a run in the background (202). Poll GET /runs/{run_id} for progress.
+
+    With `?wait=true` the request waits for the run to finish and returns the
+    final result (201).
+    """
+    record = _get_dag_or_404(session, dag_id)
+    if record.is_paused:
+        raise HTTPException(status_code=409, detail="DAG is paused. Resume it before triggering a run.")
+
+    run = runner.create_run(session, dag_id, record.definition)
+    control = runner.launch(run.run_id, record.definition)
+
+    if wait and control.task is not None:
+        await control.task
+        response.status_code = 201
+        session.expire_all()
+        run = session.get(RunRecord, run.run_id)
     return run_to_dict(run)
 
 
 @app.get("/runs")
-def list_runs(dag_id: str | None = None, session: Session = Depends(get_session)):
+def list_runs(
+    dag_id: str | None = None,
+    status: str | None = None,
+    session: Session = Depends(get_session),
+):
     query = select(RunRecord).order_by(RunRecord.started_at)
     if dag_id:
         query = query.where(RunRecord.dag_id == dag_id)
+    if status:
+        query = query.where(RunRecord.status == status)
     return [run_to_dict(run) for run in session.scalars(query).all()]
 
 
@@ -251,3 +199,36 @@ def get_run(run_id: str, session: Session = Depends(get_session)):
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return run_to_dict(run)
+
+
+@app.post("/runs/{run_id}/pause")
+def pause_run(run_id: str):
+    """Pause a running run: tasks already running finish, no new task starts."""
+    if not runner.set_paused(run_id, True):
+        raise HTTPException(status_code=409, detail="Run is not active (finished, or unknown)")
+    return {"run_id": run_id, "status": "paused"}
+
+
+@app.post("/runs/{run_id}/resume")
+def resume_run(run_id: str):
+    if not runner.set_paused(run_id, False):
+        raise HTTPException(status_code=409, detail="Run is not active (finished, or unknown)")
+    return {"run_id": run_id, "status": "running"}
+
+
+# -- built-in alert receiver (for demos) ---------------------------------------
+
+received_alerts: list[dict[str, Any]] = []
+
+
+@app.post("/alerts/sink", status_code=204)
+def receive_alert(payload: dict[str, Any]):
+    """A ready-made webhook target: set a DAG's alert_webhook to
+    http://localhost:8000/alerts/sink and its failure alerts show up in GET /alerts/sink."""
+    received_alerts.append(payload)
+    del received_alerts[:-50]  # keep the latest 50
+
+
+@app.get("/alerts/sink")
+def list_received_alerts():
+    return received_alerts

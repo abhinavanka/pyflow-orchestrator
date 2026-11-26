@@ -35,10 +35,32 @@ class CycleError(DAGError):
 class Task:
     """A single unit of work inside a DAG."""
 
-    def __init__(self, task_id: str, fn: Callable[..., Any], dag: "DAG") -> None:
+    def __init__(
+        self,
+        task_id: str,
+        fn: Callable[..., Any],
+        dag: "DAG",
+        *,
+        retries: int = 0,
+        retry_delay: float = 1.0,
+        retry_backoff: float = 2.0,
+        retry_max_delay: float = 60.0,
+    ) -> None:
+        if retries < 0:
+            raise DAGError(f"Task '{task_id}': retries must be >= 0.")
+        if retry_delay < 0 or retry_max_delay < 0:
+            raise DAGError(f"Task '{task_id}': retry delays must be >= 0.")
+        if retry_backoff < 1:
+            raise DAGError(f"Task '{task_id}': retry_backoff must be >= 1.")
         self.task_id = task_id
         self.fn = fn
         self.dag = dag
+        # Retry policy: wait retry_delay * retry_backoff**n seconds (capped at
+        # retry_max_delay) before retry number n+1. Defaults: 1s, 2s, 4s, 8s...
+        self.retries = retries
+        self.retry_delay = retry_delay
+        self.retry_backoff = retry_backoff
+        self.retry_max_delay = retry_max_delay
         self.upstream: set[str] = set()
         self.downstream: set[str] = set()
 
@@ -87,20 +109,28 @@ class DAG:
 
     # -- building ----------------------------------------------------------
 
-    def add_task(self, task_id: str, fn: Callable[..., Any]) -> Task:
+    def add_task(self, task_id: str, fn: Callable[..., Any], **retry_options: Any) -> Task:
+        """Add a task. Optional retry_options: retries, retry_delay, retry_backoff,
+        retry_max_delay (see Task)."""
         if task_id in self.tasks:
             raise DAGError(f"Duplicate task_id '{task_id}' in DAG '{self.dag_id}'.")
         if not callable(fn):
             raise DAGError(f"Task '{task_id}' needs a callable, got {type(fn).__name__}.")
-        task = Task(task_id, fn, self)
+        task = Task(task_id, fn, self, **retry_options)
         self.tasks[task_id] = task
         return task
 
-    def task(self, task_id: str | None = None) -> Callable[[Callable[..., Any]], Task]:
-        """Decorator form: the function name becomes the task_id by default."""
+    def task(
+        self, task_id: str | None = None, **retry_options: Any
+    ) -> Callable[[Callable[..., Any]], Task]:
+        """Decorator form: the function name becomes the task_id by default.
+
+            @dag.task(retries=3, retry_delay=2)
+            def flaky_download(): ...
+        """
 
         def decorator(fn: Callable[..., Any]) -> Task:
-            return self.add_task(task_id or fn.__name__, fn)
+            return self.add_task(task_id or fn.__name__, fn, **retry_options)
 
         return decorator
 
